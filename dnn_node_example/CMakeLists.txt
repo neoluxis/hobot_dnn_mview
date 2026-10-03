@@ -13,7 +13,7 @@
 # limitations under the License.
 
 cmake_minimum_required(VERSION 3.5)
-project(dnn_node_example)
+project(dnn_node_example VERSION 2.7.0)
 
 # Default to C99
 if(NOT CMAKE_C_STANDARD)
@@ -22,7 +22,7 @@ endif()
 
 # Default to C++14
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 20)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -38,6 +38,8 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(ai_msgs REQUIRED)
+find_package(nl_image_msgs REQUIRED)
+find_package(nl_detection_msgs REQUIRED)
 find_package(dnn_node REQUIRED)
 find_package(hobot_cv REQUIRED)
 find_package(cv_bridge REQUIRED)
@@ -141,6 +143,13 @@ add_library(${PROJECT_NAME}_component SHARED
   src/image_utils.cpp
   src/post_process/post_process_unet.cpp
 )
+add_library(detection_geometry STATIC
+  src/detection_geometry.cpp src/detection_result_builder.cpp)
+set_target_properties(detection_geometry PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(detection_geometry PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(detection_geometry PUBLIC cxx_std_20)
+ament_target_dependencies(detection_geometry nl_image_msgs nl_detection_msgs)
+target_link_libraries(${PROJECT_NAME}_component detection_geometry)
 
 rclcpp_components_register_node(${PROJECT_NAME}_component
   PLUGIN "DnnExampleNode"
@@ -154,6 +163,8 @@ ament_target_dependencies(
   dnn_node
   sensor_msgs
   ai_msgs
+  nl_image_msgs
+  nl_detection_msgs
   hobot_cv
   cv_bridge
 )
@@ -190,5 +201,12 @@ install(DIRECTORY
   ${PROJECT_SOURCE_DIR}/config/common/
   DESTINATION lib/${PROJECT_NAME}/config/
 )
+
+option(BUILD_NLX_TESTS "Build all NLX tests" OFF)
+option(BUILD_DNN_NODE_EXAMPLE_TESTS "Build DNN example tests" OFF)
+if(BUILD_NLX_TESTS AND BUILD_DNN_NODE_EXAMPLE_TESTS)
+  enable_testing()
+  add_subdirectory(test)
+endif()
 
 ament_package()

@@ -13,9 +13,12 @@
 // limitations under the License.
 
 #include "include/dnn_example_node.h"
+#include "detection_result_builder.h"
 
 #include <fstream>
+#include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -127,6 +130,13 @@ DnnExampleNode::DnnExampleNode(const NodeOptions &options,
   this->declare_parameter<std::string>("config_file", config_file);
   this->declare_parameter<std::string>("msg_pub_topic_name",
                                        msg_pub_topic_name_);
+  detection_topic_name_ = this->declare_parameter<std::string>(
+      "detection_topic_name", detection_topic_name_);
+  node_id_ = this->declare_parameter<std::string>("node_id", node_id_);
+  camera_ids_ = this->declare_parameter<std::vector<std::string>>(
+      "camera_ids", std::vector<std::string>{});
+  camera_topics_ = this->declare_parameter<std::vector<std::string>>(
+      "camera_topics", std::vector<std::string>{});
 
   this->get_parameter<int>("feed_type", feed_type_);
   this->get_parameter<std::string>("image", image_file_);
@@ -206,12 +216,15 @@ DnnExampleNode::DnnExampleNode(const NodeOptions &options,
               msg_pub_topic_name_.c_str());
   msg_publisher_ = this->create_publisher<ai_msgs::msg::PerceptionTargets>(
       msg_pub_topic_name_, 10);
+  detection_publisher_ =
+      this->create_publisher<nl_detection_msgs::msg::DetectionResult>(detection_topic_name_, 10);
   info_msg_publisher_ = this->create_publisher<ai_msgs::msg::PerceptionInfo>(
       info_msg_pub_topic_name_, 10);
   info_msg_pub_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(1000), [this](){
         if (perception_info_msg_ && info_msg_publisher_ && is_pub_info_ready_ &&
             info_msg_publisher_->get_subscription_count() > 0) {
+                std::lock_guard<std::mutex> lock(perception_info_mutex_);
                 perception_info_msg_->header.stamp = rclcpp::Clock().now();
                 info_msg_publisher_->publish(*perception_info_msg_);
             }
@@ -230,6 +243,21 @@ DnnExampleNode::DnnExampleNode(const NodeOptions &options,
                 "Dnn node feed with subscription");
     if (is_shared_mem_sub_) {
 #ifdef SHARED_MEM_ENABLED
+      if (!camera_ids_.empty()) {
+        if (camera_ids_.size() != camera_topics_.size()) {
+          throw std::invalid_argument("camera_ids and camera_topics must have equal lengths");
+        }
+        for (size_t i = 0; i < camera_ids_.size(); ++i) {
+          const auto camera_id = camera_ids_[i];
+          camera_subscriptions_.push_back(
+              this->create_subscription<hbm_img_msgs::msg::HbmMsg1080P>(
+                  camera_topics_[i], rclcpp::SensorDataQoS(),
+                  [this, camera_id](const hbm_img_msgs::msg::HbmMsg1080P::ConstSharedPtr msg) {
+                    SharedMemImgProcess(msg, camera_id);
+                  }));
+        }
+        return;
+      }
       RCLCPP_WARN(this->get_logger(),
                   "Create img hbmem_subscription with topic_name: %s",
                   sharedmem_img_topic_name_.c_str());
@@ -237,9 +265,9 @@ DnnExampleNode::DnnExampleNode(const NodeOptions &options,
           this->create_subscription<hbm_img_msgs::msg::HbmMsg1080P>(
               sharedmem_img_topic_name_,
               rclcpp::SensorDataQoS(),
-              std::bind(&DnnExampleNode::SharedMemImgProcess,
-                        this,
-                        std::placeholders::_1));
+              [this](const hbm_img_msgs::msg::HbmMsg1080P::ConstSharedPtr msg) {
+                SharedMemImgProcess(msg);
+              });
 #else
       RCLCPP_ERROR(this->get_logger(), "Unsupport shared mem");
 #endif
@@ -287,6 +315,20 @@ int DnnExampleNode::LoadConfig() {
                  "Parsing config file %s failed",
                  config_file.data());
     return -1;
+  }
+
+  // 配置文件可以从任意工作目录启动，类别表按已安装包的位置解析。
+  if (document.HasMember("cls_names_list") && document["cls_names_list"].IsString()) {
+    const std::filesystem::path classes(document["cls_names_list"].GetString());
+    if (!classes.is_absolute() && !std::filesystem::exists(classes)) {
+      const auto root = std::filesystem::path(config_file).parent_path().parent_path();
+      const auto resolved = root / classes;
+      if (std::filesystem::exists(resolved)) {
+        const auto path = resolved.string();
+        document["cls_names_list"].SetString(
+            path.c_str(), static_cast<rapidjson::SizeType>(path.size()), document.GetAllocator());
+      }
+    }
   }
 
   if (document.HasMember("model_file")) {
@@ -698,8 +740,11 @@ int DnnExampleNode::PostProcess(
   }
 
   // 使用resize后的分辨率作为感知结果的分辨率
-  perception_info_msg_->height = parser_output->resized_h;
-  perception_info_msg_->width = parser_output->resized_w;
+  {
+    std::lock_guard<std::mutex> lock(perception_info_mutex_);
+    perception_info_msg_->height = camera_ids_.empty() ? parser_output->resized_h : 0;
+    perception_info_msg_->width = camera_ids_.empty() ? parser_output->resized_w : 0;
+  }
 
   if (parser_output->ratio != 1.0) {
     RCLCPP_DEBUG_STREAM(get_logger(),
@@ -708,8 +753,11 @@ int DnnExampleNode::PostProcess(
       << ", img h:" << parser_output->img_h
       );
     // 如果有坐标映射，使用原始图片的分辨率作为感知结果的分辨率
-    perception_info_msg_->height = parser_output->img_h;
-    perception_info_msg_->width = parser_output->img_w;
+    if (camera_ids_.empty()) {
+      std::lock_guard<std::mutex> lock(perception_info_mutex_);
+      perception_info_msg_->height = parser_output->img_h;
+      perception_info_msg_->width = parser_output->img_w;
+    }
     // 前处理有对图片进行resize，需要将坐标映射到对应的订阅图片分辨率
     for (auto &target : pub_data->targets) {
       for (auto &roi : target.rois) {
@@ -848,6 +896,19 @@ int DnnExampleNode::PostProcess(
                   static_cast<int>(perf_pipeline.time_ms_duration)
                 );
     }
+  }
+
+  // 在单帧上下文中建立图像和检测框的关联，避免异步结果串帧。
+  if (parser_output->has_frame_metadata) {
+    std::vector<nl::detection::ModelDetection> model_detections;
+    model_detections.reserve(det_result->perception.det.size());
+    for (const auto &rect : det_result->perception.det) {
+      model_detections.push_back({{rect.bbox.xmin, rect.bbox.ymin,
+                                   rect.bbox.xmax, rect.bbox.ymax},
+                                  rect.id, rect.score});
+    }
+    detection_publisher_->publish(nl::detection::BuildResult(
+        parser_output->frame_metadata, model_detections, parser_output->ratio));
   }
 
   // 发布AI消息
@@ -1112,6 +1173,11 @@ void DnnExampleNode::RosImgProcess(
 
   // 4. 开始预测
   int ret = Run(inputs, dnn_output, nullptr);
+  if (ret == HB_DNN_TASK_NUM_EXCEED_LIMIT) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                         "Inference queue full; dropping source frame");
+    return;
+  }
   if (ret != 0 && ret != HB_DNN_TASK_NUM_EXCEED_LIMIT) {
     RCLCPP_INFO(this->get_logger(), "Run predict failed!");
     return;
@@ -1120,7 +1186,8 @@ void DnnExampleNode::RosImgProcess(
 
 #ifdef SHARED_MEM_ENABLED
 void DnnExampleNode::SharedMemImgProcess(
-    const hbm_img_msgs::msg::HbmMsg1080P::ConstSharedPtr img_msg) {
+    const hbm_img_msgs::msg::HbmMsg1080P::ConstSharedPtr img_msg,
+    const std::string &camera_id) {
   if (!img_msg) {
     return;
   }
@@ -1148,9 +1215,6 @@ void DnnExampleNode::SharedMemImgProcess(
     *this->get_clock(), 3000,
     "%s, comm delay [%.4f]ms",
     ss.str().c_str(), duration_ms);
-
-  image_height = img_msg->height;
-  image_width = img_msg->width;
 
   auto tp_start = std::chrono::system_clock::now();
 
@@ -1188,10 +1252,8 @@ void DnnExampleNode::SharedMemImgProcess(
           model_input_width_);
     } else {
       
-      image_height = img_msg->height;
-      image_width = img_msg->width;
-      dnn_output->resized_h = std::min(image_height, model_input_height_);
-      dnn_output->resized_w = std::min(image_width, model_input_width_);
+      dnn_output->resized_h = std::min(static_cast<int>(img_msg->height), model_input_height_);
+      dnn_output->resized_w = std::min(static_cast<int>(img_msg->width), model_input_width_);
 
       //不需要进行resize
       pyramid = hobot::dnn_node::ImageProc::GetNV12PyramidFromNV12Img(
@@ -1236,8 +1298,19 @@ void DnnExampleNode::SharedMemImgProcess(
   auto inputs = std::vector<std::shared_ptr<DNNInput>>{pyramid};
   // 使用订阅到的msg配置msg_header
   dnn_output->msg_header = std::make_shared<std_msgs::msg::Header>();
-  dnn_output->msg_header->set__frame_id(std::to_string(img_msg->index));
+  dnn_output->msg_header->set__frame_id(camera_id.empty() ?
+      std::to_string(img_msg->index) : camera_id);
   dnn_output->msg_header->set__stamp(img_msg->time_stamp);
+  if (!camera_id.empty()) {
+    dnn_output->has_frame_metadata = true;
+    auto &frame = dnn_output->frame_metadata;
+    frame.header = *dnn_output->msg_header;
+    frame.node_id = node_id_;
+    frame.camera_id = camera_id;
+    frame.frame_index = img_msg->index;
+    frame.width = img_msg->width;
+    frame.height = img_msg->height;
+  }
 
   // 如果开启了本地渲染功能，缓存pyramid数据
   if (dump_render_img_) {
@@ -1252,6 +1325,11 @@ void DnnExampleNode::SharedMemImgProcess(
 
   // 3. 开始预测
   int ret = Run(inputs, dnn_output, nullptr);
+  if (ret == HB_DNN_TASK_NUM_EXCEED_LIMIT) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                         "Inference queue full; dropping source frame");
+    return;
+  }
   if (ret != 0 && ret != HB_DNN_TASK_NUM_EXCEED_LIMIT) {
     RCLCPP_ERROR(this->get_logger(), "Run predict failed!");
     return;

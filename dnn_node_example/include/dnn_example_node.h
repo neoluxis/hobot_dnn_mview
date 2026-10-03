@@ -13,12 +13,15 @@
 // limitations under the License.
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "ai_msgs/msg/capture_targets.hpp"
 #include "ai_msgs/msg/perception_targets.hpp"
 #include "ai_msgs/msg/perception_info.hpp"
+#include "nl_image_msgs/msg/frame_metadata.hpp"
+#include "nl_detection_msgs/msg/detection_result.hpp"
 #ifdef CV_BRIDGE_CPP
 #include <cv_bridge/cv_bridge.hpp>
 #else
@@ -74,6 +77,9 @@ enum class DnnParserType {
 
 // dnn node输出数据类型
 struct DnnExampleOutput : public DnnNodeOutput {
+  // 异步任务专属的源帧身份，禁止使用节点级可变状态推断来源。
+  nl_image_msgs::msg::FrameMetadata frame_metadata;
+  bool has_frame_metadata = false;
   // resize参数，用于算法检测结果的映射
   float ratio = 1.0;  //缩放比例系数，无需缩放为1
 
@@ -144,6 +150,11 @@ class DnnExampleNode : public DnnNode {
 
   // 发布AI消息的topic和发布者
   std::string msg_pub_topic_name_ = "hobot_dnn_detection";
+  std::string detection_topic_name_ = "detection_result";
+  std::string node_id_ = "local";
+  std::vector<std::string> camera_ids_;
+  std::vector<std::string> camera_topics_;
+  rclcpp::Publisher<nl_detection_msgs::msg::DetectionResult>::SharedPtr detection_publisher_;
   rclcpp::Publisher<ai_msgs::msg::PerceptionTargets>::SharedPtr msg_publisher_ =
       nullptr;
   // 发布感知结果信息，如感知结果对应的图像分辨率，支持的类别等
@@ -151,6 +162,7 @@ class DnnExampleNode : public DnnNode {
   rclcpp::Publisher<ai_msgs::msg::PerceptionInfo>::SharedPtr info_msg_publisher_ =
   nullptr;
   ai_msgs::msg::PerceptionInfo::SharedPtr perception_info_msg_ = nullptr;
+  std::mutex perception_info_mutex_;
   std::shared_ptr<rclcpp::TimerBase> info_msg_pub_timer_ = nullptr;
   std::atomic_bool is_pub_info_ready_ = false;
 
@@ -159,9 +171,12 @@ class DnnExampleNode : public DnnNode {
 #ifdef SHARED_MEM_ENABLED
   rclcpp::Subscription<hbm_img_msgs::msg::HbmMsg1080P>::ConstSharedPtr
       sharedmem_img_subscription_ = nullptr;
+  std::vector<rclcpp::Subscription<hbm_img_msgs::msg::HbmMsg1080P>::SharedPtr>
+      camera_subscriptions_;
   std::string sharedmem_img_topic_name_ = "/hbmem_img";
   void SharedMemImgProcess(
-      const hbm_img_msgs::msg::HbmMsg1080P::ConstSharedPtr msg);
+      const hbm_img_msgs::msg::HbmMsg1080P::ConstSharedPtr msg,
+      const std::string &camera_id = "");
 #endif
 
   // 非共享内存模式
